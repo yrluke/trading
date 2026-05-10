@@ -132,6 +132,33 @@ def _add_year_col(lf: pl.LazyFrame) -> pl.LazyFrame:
 # Polars 批量读取（按月 glob，Rust 层文件发现）
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _day_col_count(day_dir: Path) -> int:
+    """读取交易日目录内首个 CSV 的列数（仅读首行，极快）。"""
+    for f in day_dir.glob("*.csv"):
+        with open(f) as fp:
+            return len(fp.readline().strip().split(","))
+    return 0
+
+
+def _scan_day_dir(day_dir: Path, schema: dict[str, type]) -> pl.LazyFrame | None:
+    """对单个交易日目录做 scan_csv，返回 LazyFrame；目录为空则返回 None。"""
+    files = list(day_dir.glob("*.csv"))
+    if not files:
+        return None
+    actual_cols = set(pl.read_csv(files[0], n_rows=0).columns)
+    filtered_schema = {k: v for k, v in schema.items() if k in actual_cols}
+    try:
+        day_glob = day_dir.relative_to(Path.cwd()).as_posix() + "/*.csv"
+    except ValueError:
+        day_glob = day_dir.as_posix() + "/*.csv"
+    return pl.scan_csv(
+        day_glob,
+        has_header=True,
+        schema_overrides=filtered_schema,
+        infer_schema_length=0,
+    )
+
+
 def load_month_glob(
     month_dir: Path,
     day_dirs: list[Path],
@@ -143,12 +170,10 @@ def load_month_glob(
     【性能关键】传入 glob 字符串而非 list[Path]：
     - Polars（Rust 层）调用 OS 原生目录枚举，无 Python 逐路径对象开销
     - 单个 LazyFrame → 单次 collect()，消除 22 次 scan+collect 的重复开销
-    - infer_schema_length=0：schema 已由调用方指定，跳过类型推断 I/O
+    - infer_schema_length=0：schema 已知，跳过推断节省 I/O
 
-    glob 模式 "month_dir/*/*.csv" 匹配：
-        202401/20240102/000001.csv
-        202401/20260105/000001.csv
-    等所有交易日目录下的 CSV 文件。
+    【schema 兼容性】当月内不同交易日列数不一致（如某日新增/删除了字段）时，
+    自动降级为逐日扫描模式，用 diagonal_relaxed 合并，缺失列填 null。
 
     Parameters
     ----------
@@ -164,32 +189,51 @@ def load_month_glob(
     pl.DataFrame
         含 year 列的处理后 DataFrame
     """
-    # 采样第一个交易日的首个文件，确定实际列名（部分列可能不存在，需过滤）
-    sample_files = list(day_dirs[0].glob("*.csv"))
-    if not sample_files:
+    if not day_dirs:
         return pl.DataFrame()
 
-    actual_cols = set(pl.read_csv(sample_files[0], n_rows=0).columns)
-    filtered_schema = {k: v for k, v in schema.items() if k in actual_cols}
+    # 采样每个交易日的列数（只读首行，极快）
+    col_counts = {_day_col_count(d) for d in day_dirs if any(d.glob("*.csv"))}
+    col_counts.discard(0)
+    if not col_counts:
+        return pl.DataFrame()
 
-    # glob 字符串：Rust 层展开，匹配 month_dir/YYYYMMDD/*.csv
-    # Windows 上 Polars scan_csv(glob) 只支持相对路径，转换为相对 cwd 的路径
-    try:
-        month_glob = month_dir.relative_to(Path.cwd()).as_posix() + "/*/*.csv"
-    except ValueError:
-        # 若 month_dir 不在 cwd 下，则退回绝对路径
-        month_glob = month_dir.as_posix() + "/*/*.csv"
-
-    # 惰性扫描 → 向量化时间解析 → 添加年份列 → 一次触发执行
-    lf = pl.scan_csv(
-        month_glob,
-        has_header=True,
-        schema_overrides=filtered_schema,
-        infer_schema_length=0,   # schema 已知，跳过推断节省 I/O
-    )
-    lf = _parse_time_columns(lf)
-    lf = _add_year_col(lf)
-    return lf.collect()
+    if len(col_counts) == 1:
+        # ── 快速路径：月内 schema 一致，单次 glob 扫描 ──
+        sample_files = list(day_dirs[0].glob("*.csv"))
+        actual_cols = set(pl.read_csv(sample_files[0], n_rows=0).columns)
+        filtered_schema = {k: v for k, v in schema.items() if k in actual_cols}
+        try:
+            month_glob = month_dir.relative_to(Path.cwd()).as_posix() + "/*/*.csv"
+        except ValueError:
+            month_glob = month_dir.as_posix() + "/*/*.csv"
+        lf = pl.scan_csv(
+            month_glob,
+            has_header=True,
+            schema_overrides=filtered_schema,
+            infer_schema_length=0,
+        )
+        lf = _parse_time_columns(lf)
+        lf = _add_year_col(lf)
+        return lf.collect()
+    else:
+        # ── 兼容路径：月内 schema 不一致，逐日扫描后 diagonal_relaxed 合并 ──
+        logger.warning(
+            "[load_month_glob] 月份 %s 内检测到混合列数 %s，降级为逐日扫描模式",
+            month_dir.name,
+            col_counts,
+        )
+        frames: list[pl.DataFrame] = []
+        for d in day_dirs:
+            lf = _scan_day_dir(d, schema)
+            if lf is None:
+                continue
+            lf = _parse_time_columns(lf)
+            lf = _add_year_col(lf)
+            frames.append(lf.collect())
+        if not frames:
+            return pl.DataFrame()
+        return pl.concat(frames, how="diagonal_relaxed")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
