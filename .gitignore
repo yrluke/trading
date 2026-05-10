@@ -1,0 +1,21 @@
+# 原始 CSV 数据及生成的 Parquet 数据（体积大，不纳入版本控制）
+data/
+
+# Python 临时文件
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# 测试/诊断脚本（临时文件）
+_test_*.py
+_diag*.py
